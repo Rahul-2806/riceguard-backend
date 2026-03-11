@@ -88,8 +88,8 @@ def generate_gradcam_onnx(img_array: np.ndarray, class_idx: int) -> str | None:
     Works without TensorFlow gradients.
     """
     try:
-        patch_size = 32
-        stride = 16
+        patch_size = 56
+        stride = 28
         h, w = IMG_SIZE
         sensitivity_map = np.zeros((h, w), dtype=np.float32)
         baseline_pred = run_inference(img_array)[class_idx]
