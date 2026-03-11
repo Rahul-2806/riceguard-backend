@@ -1,0 +1,8 @@
+*.keras
+*.h5
+*.tflite
+*.pkl
+splits/
+dataset/
+__pycache__/
+.env
