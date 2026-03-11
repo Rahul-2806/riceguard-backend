@@ -7,13 +7,12 @@ from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import tensorflow as tf
-from tensorflow import keras
+import onnxruntime as ort
 
 # ── App ──
 app = FastAPI(
-    title="Rice Leaf Disease Detection API",
-    description="Detects Bacterial Leaf Blight, Brown Spot, and Leaf Smut from rice leaf images using ResNet50V2",
+    title="RiceGuard — Rice Leaf Disease Detection API",
+    description="Detects Bacterial Leaf Blight, Brown Spot, and Leaf Smut using ResNet50V2",
     version="1.0.0"
 )
 
@@ -51,30 +50,87 @@ CLASS_INFO = {
     }
 }
 
-# ── Load model on startup ──
-model = None
+# ── Load ONNX model on startup ──
+session = None
 
 @app.on_event("startup")
 async def load_model():
-    global model
-    model_path = "rice_disease_best_model.keras"
+    global session
+    model_path = "rice_model.onnx"
     if not os.path.exists(model_path):
-        print(f"⚠️  Model file not found at {model_path}")
+        print(f"⚠️  Model not found at {model_path}")
         return
-    print("Loading model...")
-    model = keras.models.load_model(model_path)
+    print("Loading ONNX model...")
+    session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
     # Warmup
-    dummy = np.zeros((1, *IMG_SIZE, 3))
-    model.predict(dummy, verbose=0)
-    print(f"✅ Model loaded successfully!")
-    print(f"   Input shape: {model.input_shape}")
+    dummy = np.zeros((1, *IMG_SIZE, 3), dtype=np.float32)
+    session.run(None, {session.get_inputs()[0].name: dummy})
+    print(f"✅ ONNX model loaded!")
+    print(f"   Input : {session.get_inputs()[0].name} {session.get_inputs()[0].shape}")
+    print(f"   Output: {session.get_outputs()[0].name} {session.get_outputs()[0].shape}")
 
-# ── Health check ──
+
+def preprocess(img: Image.Image) -> np.ndarray:
+    img = img.convert("RGB").resize(IMG_SIZE)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, axis=0)
+
+
+def run_inference(img_array: np.ndarray) -> np.ndarray:
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: img_array})
+    return outputs[0][0]  # shape: (3,)
+
+
+def generate_gradcam_onnx(img_array: np.ndarray, class_idx: int) -> str | None:
+    """
+    Approximate Grad-CAM using occlusion-based sensitivity map.
+    Works without TensorFlow gradients.
+    """
+    try:
+        patch_size = 32
+        stride = 16
+        h, w = IMG_SIZE
+        sensitivity_map = np.zeros((h, w), dtype=np.float32)
+        baseline_pred = run_inference(img_array)[class_idx]
+
+        for y in range(0, h - patch_size + 1, stride):
+            for x in range(0, w - patch_size + 1, stride):
+                occluded = img_array.copy()
+                occluded[0, y:y+patch_size, x:x+patch_size, :] = 0.5  # grey patch
+                occluded_pred = run_inference(occluded)[class_idx]
+                drop = baseline_pred - occluded_pred
+                sensitivity_map[y:y+patch_size, x:x+patch_size] += drop
+
+        # Normalize
+        sensitivity_map = np.maximum(sensitivity_map, 0)
+        if sensitivity_map.max() > 0:
+            sensitivity_map = sensitivity_map / sensitivity_map.max()
+
+        # Overlay
+        img_np = (img_array[0] * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        heatmap_colored = cv2.applyColorMap(np.uint8(255 * sensitivity_map), cv2.COLORMAP_JET)
+        superimposed = cv2.addWeighted(img_bgr, 0.6, heatmap_colored, 0.4, 0)
+        superimposed_rgb = cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB)
+
+        pil_img = Image.fromarray(superimposed_rgb)
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    except Exception as e:
+        print(f"Grad-CAM error: {e}")
+        return None
+
+
+# ── Endpoints ──
+
 @app.get("/")
 def root():
     return {
         "status": "online",
-        "model": "ResNet50V2",
+        "model": "ResNet50V2 (ONNX)",
         "classes": CLASSES,
         "accuracy": "88.89%",
         "roc_auc": "0.9676"
@@ -82,127 +138,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model_loaded": model is not None}
+    return {"status": "healthy", "model_loaded": session is not None}
 
-# ── Grad-CAM ──
-def generate_gradcam(model, img_array, class_idx):
-    try:
-        # Find last conv layer
-        last_conv_layer = None
-        for layer in reversed(model.layers):
-            if hasattr(layer, 'layers'):  # base model
-                for sublayer in reversed(layer.layers):
-                    if isinstance(sublayer, tf.keras.layers.Conv2D):
-                        last_conv_layer = sublayer.name
-                        break
-                if last_conv_layer:
-                    break
-            elif isinstance(layer, tf.keras.layers.Conv2D):
-                last_conv_layer = layer.name
-                break
-
-        if not last_conv_layer:
-            return None
-
-        grad_model = keras.Model(
-            model.inputs,
-            [model.get_layer(last_conv_layer).output, model.output]
-        )
-
-        with tf.GradientTape() as tape:
-            conv_output, preds = grad_model(img_array)
-            class_channel = preds[:, class_idx]
-
-        grads = tape.gradient(class_channel, conv_output)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        conv_output = conv_output[0]
-        heatmap = conv_output @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
-        heatmap = heatmap.numpy()
-
-        # Overlay on image
-        img_np = (img_array[0] * 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        heatmap_resized = cv2.resize(heatmap, IMG_SIZE)
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-        superimposed = cv2.addWeighted(img_bgr, 0.6, heatmap_colored, 0.4, 0)
-        superimposed_rgb = cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB)
-
-        # Encode to base64
-        pil_img = Image.fromarray(superimposed_rgb)
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format="PNG")
-        gradcam_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return gradcam_b64
-
-    except Exception as e:
-        print(f"Grad-CAM error: {e}")
-        return None
-
-
-# ── Predict endpoint ──
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    # Validate file type
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-
-    try:
-        # Read and preprocess image
-        contents = await file.read()
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
-        img_resized = img.resize(IMG_SIZE)
-        img_array = np.array(img_resized) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
-
-        # Predict
-        predictions = model.predict(img_array, verbose=0)[0]
-        predicted_idx = int(np.argmax(predictions))
-        predicted_class = CLASSES[predicted_idx]
-        confidence = float(predictions[predicted_idx]) * 100
-
-        # All class probabilities
-        all_probs = {
-            CLASSES[i]: round(float(predictions[i]) * 100, 2)
-            for i in range(len(CLASSES))
-        }
-
-        # Grad-CAM
-        gradcam_b64 = generate_gradcam(model, img_array, predicted_idx)
-
-        # Original image as base64
-        buffer = io.BytesIO()
-        img_resized.save(buffer, format="PNG")
-        original_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-        return JSONResponse({
-            "predicted_class": predicted_class,
-            "confidence": round(confidence, 2),
-            "all_probabilities": all_probs,
-            "class_info": CLASS_INFO[predicted_class],
-            "gradcam_image": gradcam_b64,
-            "original_image": original_b64,
-            "model_stats": {
-                "model": "ResNet50V2",
-                "test_accuracy": "88.89%",
-                "roc_auc": "0.9676",
-                "dataset": "119 rice leaf images"
-            }
-        })
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
-
-
-# ── Stats endpoint ──
 @app.get("/stats")
 def stats():
     return {
-        "model": "ResNet50V2 Transfer Learning",
+        "model": "ResNet50V2 Transfer Learning (ONNX)",
         "dataset_size": 119,
         "classes": CLASSES,
         "test_accuracy": "88.89%",
@@ -218,3 +159,52 @@ def stats():
             "Weighted Ensemble"
         ]
     }
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    if session is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        contents = await file.read()
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img_array = preprocess(img)
+
+        # Predict
+        predictions = run_inference(img_array)
+        predicted_idx = int(np.argmax(predictions))
+        predicted_class = CLASSES[predicted_idx]
+        confidence = float(predictions[predicted_idx]) * 100
+
+        all_probs = {
+            CLASSES[i]: round(float(predictions[i]) * 100, 2)
+            for i in range(len(CLASSES))
+        }
+
+        # Grad-CAM
+        gradcam_b64 = generate_gradcam_onnx(img_array, predicted_idx)
+
+        # Original image as base64
+        buffer = io.BytesIO()
+        img.resize(IMG_SIZE).save(buffer, format="PNG")
+        original_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        return JSONResponse({
+            "predicted_class": predicted_class,
+            "confidence": round(confidence, 2),
+            "all_probabilities": all_probs,
+            "class_info": CLASS_INFO[predicted_class],
+            "gradcam_image": gradcam_b64,
+            "original_image": original_b64,
+            "model_stats": {
+                "model": "ResNet50V2 (ONNX)",
+                "test_accuracy": "88.89%",
+                "roc_auc": "0.9676",
+                "dataset": "119 rice leaf images"
+            }
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
